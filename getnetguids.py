@@ -1,12 +1,38 @@
-#!/usr/bin/env python2
-import pefile
-import struct
-import re
-import datetime
+#!/usr/bin/env python
+
+from __future__ import print_function
+
 import csv
+import datetime
 import hashlib
+import os
+import pefile
+import re
+import shutil
+import struct
+import sys
+import zipfile
 
 guid_regex = re.compile("[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}")
+
+
+def extract_nested_zip(filename, to):
+    """ Extract a zip file including any nested zip files
+
+        NOTE: This delete the zip file(s) after extraction 
+        to counter infinite recursion.
+
+        NOTE: Extracted files may be replaced by files that 
+        are recursively extracted; 'directories' are not kept.
+    """
+    with zipfile.ZipFile(filename, 'r') as zfile:
+        zfile.extractall(path=to)
+    os.remove(filename)
+    for root, dirs, files in os.walk(to):
+        for nested_filename in files:
+            file_spec = os.path.join(root, nested_filename)
+            if zipfile.is_zipfile(file_spec):
+                extract_nested_zip(file_spec, root)
 
 
 def format_guid_from_hex(hex_string):
@@ -249,13 +275,12 @@ def get_assembly_guids(assembly_path):
 if __name__ == "__main__":
     from argparse import ArgumentParser
 
-    version = "1.4.2"
+    version = "1.4.3"
 
     parser = ArgumentParser(
         prog=__file__,
-        description="Extracts Typelib IDs and MVIDs from .NET assemblies.",
-        version="%(prog)s v" + version + " by Brian Wallace (@botnet_hunter)",
-        epilog="%(prog)s v" + version + " by Brian Wallace (@botnet_hunter)"
+        description="Extracts Typelib IDs and MVIDs from .NET assemblies and packages, such as MSIX bundles.",
+        epilog="%(prog)s v" + version + " by Herman Slatman (@hslatman) based on guids.py by Brian Wallace (@botnet_hunter)"
     )
     parser.add_argument('path', metavar='path', type=str, nargs='*', default=[],
                         help="Paths to files or directories to scan")
@@ -267,17 +292,55 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.path is None or len(args.path) == 0:
-        if not args.stdin:
-            parser.print_help()
-            exit()
+        parser.print_help()
+        exit()
+
+    if sys.version_info[0] > 2:
+        print('This script does not produce correct results for Python > 2 (yet)! Please use Python 2 to run this script.')
+        exit()
 
     from os.path import isfile, isdir, join, abspath
     from glob import iglob
+    import tempfile
 
     def scan_paths(paths, recursive):
+
+        # NOTE: we're always creating a temporary directory; this is used for unzipping zip-like files
+        temp_dir = tempfile.mkdtemp()
+
         while len(paths) != 0:
             temporary_file_path = abspath(paths[0])
             del paths[0]
+            if zipfile.is_zipfile(temporary_file_path):
+
+                # create backup of file, because extract_nested_zip removes the source file
+                original_hash = None
+                with open(temporary_file_path, 'rb') as handle:
+                    original_hash = hashlib.sha256(handle.read()).hexdigest()
+                if original_hash == None:
+                    print('Could not determine the hash of {temporary_file_path} before storing the backup!')
+                    exit()
+                
+                backup = tempfile.mktemp() 
+                shutil.copy2(temporary_file_path, backup)
+
+                # extract a (potential) zip recursively to the temporary directory
+                # because the function is responsible for denesting the zips, only the temp_dir needs to be appended to paths
+                extract_nested_zip(temporary_file_path, temp_dir)
+                paths.append(temp_dir)
+
+                # restore the original file
+                shutil.copy2(backup, temporary_file_path)
+                replaced_hash = None
+                with open(temporary_file_path, 'rb') as handle:
+                    replaced_hash = hashlib.sha256(handle.read()).hexdigest()
+                if replaced_hash == None:
+                    print('Could not determine the hash of {temporary_file_path} after restoring the backup!')
+                    exit()
+
+                if original_hash != replaced_hash:
+                    print('Restoring the backup failed! :-(')
+
             if isfile(temporary_file_path):
                 yield temporary_file_path, get_assembly_guids(temporary_file_path)
             elif isdir(temporary_file_path):
@@ -287,6 +350,10 @@ if __name__ == "__main__":
                         paths.append(p)
                     if isfile(p):
                         yield p, get_assembly_guids(p)
+
+        # NOTE: and of course we clean the temporary directory
+        shutil.rmtree(temp_dir)
+
     def get_compiletime(pe):
         return datetime.datetime.fromtimestamp(pe.FILE_HEADER.TimeDateStamp)
         
@@ -295,7 +362,7 @@ if __name__ == "__main__":
         writer=csv.writer(theCSV)
         writer.writerow(('TYPELIB', 'MVID', 'HASH', 'COMPILED', 'PATH'))
     else:
-        print "{0}\t\t\t\t\t{1}\t\t\t\t\t{2}\t\t\t\t\t{3}\t\t{4}".format('TYPELIB', 'MVID', 'HASH', 'COMPILED', 'PATH')
+        print("{0}\t\t\t\t\t{1}\t\t\t\t\t{2}\t\t\t\t\t{3}\t\t{4}".format('TYPELIB', 'MVID', 'HASH', 'COMPILED', 'PATH'))
     
     for file_path, result in scan_paths(args.path, args.recursive):
         if result is None:
@@ -320,7 +387,7 @@ if __name__ == "__main__":
         if args.csv:
             writer.writerow((typelib_id, mvid, s, compiled, file_path))
         else:
-            print "{0}\t{1}\t{2}\t{3}\t{4}".format(typelib_id, mvid, s, compiled, file_path)
+            print("{0}\t{1}\t{2}\t{3}\t{4}".format(typelib_id, mvid, s, compiled, file_path))
             
     if args.csv:        
         theCSV.close()
